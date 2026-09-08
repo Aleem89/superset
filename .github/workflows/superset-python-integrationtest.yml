@@ -210,7 +210,13 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Setup Python
-        uses: ./.github/actions/setup-backend/
+        # The required apache/infrastructure-actions asf-allowlist-check only
+        # recognizes the legacy workspace-relative `./` prefix for in-repo
+        # actions; it misclassifies GitHub's newer `$/` self-repository
+        # syntax as an external action and hard-fails the build (see #44014).
+        # Keep `./` here until apache/infrastructure-actions#1254 (teach the
+        # allowlist check to recognize `$/` refs) merges upstream.
+        uses: ./.github/actions/setup-backend/ # zizmor: ignore[self-repository] - $/ syntax breaks the required ASF allowlist check until infrastructure-actions#1254 merges
       - name: Install dependencies
         uses: ./.github/actions/cached-dependencies
         with:
