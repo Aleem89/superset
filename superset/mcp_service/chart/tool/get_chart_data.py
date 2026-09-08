@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 from superset.charts.data.form_data import set_query_context_form_data
 from superset.commands.exceptions import CommandException
 from superset.exceptions import OAuth2Error, OAuth2RedirectError, SupersetException
-from superset.extensions import event_logger
+from superset.extensions import db, event_logger
 from superset.mcp_service import guest_scope
 from superset.mcp_service.chart.chart_helpers import (
     build_query_context_from_form_data,
@@ -471,6 +471,13 @@ async def get_chart_data(  # noqa: C901
                 request.identifier, query_options=chart_query_options
             )
             if chart is not None:
+                # Eagerly load every column value while the session is still
+                # active. SQLAlchemy expires object attributes on commit, and
+                # this tool crosses many await points and nested
+                # event_logger.log_context() blocks that commit on exit; a
+                # later attribute read on the expired instance would raise
+                # DetachedInstanceError. Mirrors get_chart_preview.
+                db.session.refresh(chart)
                 guest_dashboard_id = guest_scope.guest_dashboard_id(chart)
 
         if not chart:

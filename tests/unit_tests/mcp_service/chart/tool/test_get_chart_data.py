@@ -19,6 +19,7 @@
 Tests for the get_chart_data request schema and chart type fallback handling.
 """
 
+import contextlib
 import importlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -1331,6 +1332,22 @@ def mock_auth():
         yield mock_get_user
 
 
+@pytest.fixture
+def stub_session_refresh():
+    """No-op db.session.refresh() for tests using an unmapped chart double.
+
+    get_chart_data refreshes the chart right after lookup so its columns are
+    loaded before the session can expire. SQLAlchemy rejects that call on a
+    SimpleNamespace; in production the DAO always returns a persistent Slice.
+    """
+    from unittest.mock import patch
+
+    from superset.extensions import db
+
+    with patch.object(db.session, "refresh", return_value=None):
+        yield
+
+
 def _extract_metrics_load_path(load_opt: Any) -> list[str]:
     """Walk a SQLAlchemy Load option and return the attr chain.
 
@@ -1565,7 +1582,7 @@ class TestSavedChartExtraFormDataFilters:
 
     @pytest.mark.asyncio
     async def test_filters_key_reaches_executed_query(
-        self, mcp_server: Any, mock_auth: Any
+        self, mcp_server: Any, mock_auth: Any, stub_session_refresh: Any
     ) -> None:
         """extra_form_data using the native 'filters' format is applied."""
         loaded, _ = await self._run(
@@ -1576,7 +1593,7 @@ class TestSavedChartExtraFormDataFilters:
 
     @pytest.mark.asyncio
     async def test_adhoc_filters_key_reaches_executed_query(
-        self, mcp_server: Any, mock_auth: Any
+        self, mcp_server: Any, mock_auth: Any, stub_session_refresh: Any
     ) -> None:
         """extra_form_data using the 'adhoc_filters' format is also applied."""
         loaded, _ = await self._run(
@@ -1598,7 +1615,7 @@ class TestSavedChartExtraFormDataFilters:
 
     @pytest.mark.asyncio
     async def test_temporal_range_filter_reaches_executed_query(
-        self, mcp_server: Any, mock_auth: Any
+        self, mcp_server: Any, mock_auth: Any, stub_session_refresh: Any
     ) -> None:
         """A TEMPORAL_RANGE filter narrows the query, not just simple filters."""
         loaded, _ = await self._run(
@@ -1622,7 +1639,7 @@ class TestSavedChartExtraFormDataFilters:
 
     @pytest.mark.asyncio
     async def test_unknown_adhoc_filter_column_returns_validation_error(
-        self, mcp_server: Any, mock_auth: Any
+        self, mcp_server: Any, mock_auth: Any, stub_session_refresh: Any
     ) -> None:
         """A rejected request filter must not return plausible unfiltered data."""
         _, result = await self._run(
@@ -1736,6 +1753,7 @@ class TestOAuthErrorRouting:
         self,
         mcp_server: Any,
         mock_auth: Any,
+        stub_session_refresh: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from fastmcp import Client
@@ -1767,6 +1785,7 @@ class TestOAuthErrorRouting:
         self,
         mcp_server: Any,
         mock_auth: Any,
+        stub_session_refresh: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from fastmcp import Client
@@ -2207,7 +2226,7 @@ class TestGuestScoping:
 
     @pytest.mark.asyncio
     async def test_guest_query_pinned_to_dashboard_with_existence_only_check(
-        self, mcp_server, mock_auth
+        self, mcp_server, mock_auth, stub_session_refresh
     ) -> None:
         from unittest.mock import patch
 
@@ -2591,3 +2610,126 @@ async def test_query_from_form_data_refreshed_reflects_force_refresh_only(
     assert isinstance(result, ChartData)
     assert result.cache_status is not None
     assert result.cache_status.refreshed is expected_refreshed
+
+
+class _AccessRecordingChart:
+    """Slice stand-in that appends every attribute read to a shared event log.
+
+    Lets a test assert the *order* of session.refresh() relative to the first
+    chart attribute access, which is the property that makes the fix work.
+    """
+
+    _COLUMNS = {
+        "id": 42,
+        "slice_name": "Sales Chart",
+        "viz_type": "table",
+        "datasource_id": 1,
+        "datasource_type": "table",
+        "params": "{}",
+        "query_context": None,
+    }
+
+    def __init__(self, events: list[str]) -> None:
+        object.__setattr__(self, "_events", events)
+
+    def __getattr__(self, name: str) -> Any:
+        object.__getattribute__(self, "_events").append(f"attr:{name}")
+        try:
+            return self._COLUMNS[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+class TestDetachedInstanceError:
+    """Regression tests for the DetachedInstanceError on the chart Slice.
+
+    get_chart_data is async and crosses many await points; the nested
+    event_logger.log_context() blocks commit the DB session on exit, which
+    expires every loaded ORM attribute. Later attribute access on the chart
+    then raises DetachedInstanceError, which the broad SQLAlchemyError handler
+    turns into a confusing internal-session error instead of chart data.
+
+    Calling db.session.refresh() immediately after the lookup loads all column
+    values into the instance while the session is still live, so a later
+    expiry has nothing left to lazily fetch. Mirrors the fix already applied
+    to get_chart_preview.
+    """
+
+    def _patches(self, module: Any, chart: Any, refresh: Any) -> tuple[Any, ...]:
+        from unittest.mock import patch
+
+        from superset.extensions import db
+
+        return (
+            patch.object(module, "find_chart_by_identifier", return_value=chart),
+            # Patched on the shared extension session rather than the tool
+            # module, so a missing refresh surfaces as a failed assertion
+            # rather than an AttributeError on the module's db import.
+            patch.object(db.session, "refresh", side_effect=refresh),
+            # Short-circuits the tool right after the lookup so the assertions
+            # target the lookup block rather than the query pipeline.
+            patch.object(
+                module,
+                "validate_chart_dataset",
+                return_value=SimpleNamespace(
+                    is_valid=False, error="Dataset gone", warnings=[]
+                ),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_refresh_called_after_chart_load(self, mcp_server, mock_auth):
+        """db.session.refresh() runs once on the chart returned by the lookup."""
+        from fastmcp import Client
+
+        module = importlib.import_module(
+            "superset.mcp_service.chart.tool.get_chart_data"
+        )
+        chart = _AccessRecordingChart([])
+        refreshed: list[object] = []
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patches(module, chart, refreshed.append):
+                stack.enter_context(patcher)
+            async with Client(mcp_server) as client:
+                await client.call_tool(
+                    "get_chart_data", {"request": {"identifier": 42}}
+                )
+
+        assert refreshed == [chart], (
+            "db.session.refresh() must be called exactly once with the chart "
+            f"loaded by find_chart_by_identifier; got {refreshed!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_refresh_precedes_chart_attribute_access(
+        self, mcp_server, mock_auth
+    ):
+        """The refresh must happen before anything reads a chart attribute.
+
+        A refresh placed after the first attribute read would leave that read
+        exposed to an expired session, which is the bug being fixed.
+        """
+        from fastmcp import Client
+
+        module = importlib.import_module(
+            "superset.mcp_service.chart.tool.get_chart_data"
+        )
+        events: list[str] = []
+        chart = _AccessRecordingChart(events)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._patches(
+                module, chart, lambda _obj: events.append("refresh")
+            ):
+                stack.enter_context(patcher)
+            async with Client(mcp_server) as client:
+                await client.call_tool(
+                    "get_chart_data", {"request": {"identifier": 42}}
+                )
+
+        assert "refresh" in events, "db.session.refresh() was never called"
+        assert events[0] == "refresh", (
+            "db.session.refresh() must run before the first chart attribute "
+            f"access; event order was {events[:5]}"
+        )
